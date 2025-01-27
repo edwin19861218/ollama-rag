@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/milvus-io/milvus-sdk-go/v2/client"
 	"github.com/milvus-io/milvus-sdk-go/v2/entity"
@@ -23,16 +23,13 @@ func main() {
 	ctx := context.Background()
 	store, err := newStore(ctx)
 	if err != nil {
-		log.Fatalf("new store: %v\n", err)
+		log.Fatalf("init store error: %v\n", err)
 	}
 	loadFile(store, ctx)
 	question := "kubernetes是什么，请使用英语详尽回答，并且回答内容大于500字"
 	docs := search(store, ctx, question)
-	//for _,doc := range docs {
-	//fmt.Println(doc)
-	//}
-	ask(docs, ctx, question)
-
+	correctiveDocs := gradeDocuments(docs, ctx, question)
+	ask(correctiveDocs, ctx, question)
 }
 func newStore(ctx context.Context) (vectorstores.VectorStore, error) {
 	llm, err := ollama.New(ollama.WithModel("nomic-embed-text:latest"))
@@ -66,7 +63,7 @@ func newStore(ctx context.Context) (vectorstores.VectorStore, error) {
 func loadFile(store vectorstores.VectorStore, ctx context.Context) {
 	f, err := os.Open("./data/k8s.txt")
 	if err != nil {
-		fmt.Println("Error opening file: ", err)
+		log.Fatal("Error opening file: ", err)
 		return
 	}
 	p := documentloaders.NewText(f)
@@ -77,20 +74,67 @@ func loadFile(store vectorstores.VectorStore, ctx context.Context) {
 	docs, err := p.LoadAndSplit(context.Background(), split)
 
 	if err != nil {
-		fmt.Println("Error loading document: ", err)
+		log.Fatal("Error loading document: ", err)
 	}
 
 	log.Println("Document loaded: ", len(docs))
-	store.AddDocuments(ctx, docs)
+	_, err = store.AddDocuments(ctx, docs)
+	if err != nil {
+		log.Fatal("Error adding document: ", err)
+	}
 }
 
 func search(store vectorstores.VectorStore, ctx context.Context, query string) []schema.Document {
 	docs, err := store.SimilaritySearch(ctx, query, 5)
 	if err != nil {
-		fmt.Println("Error search: ", err)
+		log.Fatal("Error search: ", err)
 		return nil
 	}
 	return docs
+}
+
+// see https://langchain-ai.github.io/langgraph/tutorials/rag/langgraph_crag/#create-index
+func gradeDocuments(docs []schema.Document, ctx context.Context, question string) []schema.Document {
+	log.Printf("grading docs, input docs %d \n", len(docs))
+	llm, err := ollama.New(ollama.WithModel("deepseek-r1:8b"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	systemTemplate := `
+You are a grader assessing relevance of a retrieved document to a user question. \n 
+    If the document contains keyword(s) or semantic meaning related to the question, grade it as relevant. \n
+    Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question.
+	Give me the result with json format which includes two keys 'think' and 'result'
+`
+	userTemplate := `
+Retrieved document: \n\n {{.document}} \n\n User question:{{.question}}
+`
+	ut := prompts.NewHumanMessagePromptTemplate(userTemplate, []string{"document", "question"})
+	st := prompts.NewSystemMessagePromptTemplate(systemTemplate, nil)
+	pros := prompts.NewChatPromptTemplate([]prompts.MessageFormatter{ut, st})
+	var correctiveDocs []schema.Document
+	for index, v := range docs {
+		chain1 := chains.NewLLMChain(llm, pros)
+		m := make(map[string]any)
+		m["document"] = v.PageContent
+		m["question"] = question
+		res, err := chains.Call(ctx, chain1, m)
+		if err != nil {
+			log.Println("grade call err", err)
+			continue
+		}
+		if text, ok := res["text"]; ok {
+			if val, ok := text.(string); ok {
+				if strings.Contains(val, "\"result\": \"yes\"") {
+					correctiveDocs = append(correctiveDocs, v)
+					continue
+				}
+			}
+		}
+		log.Printf("doc NO.%d incorrect \n %v \n\n", index, res)
+	}
+	log.Printf("graded docs, output docs %d\n", len(correctiveDocs))
+	return correctiveDocs
 }
 
 func ask(docs []schema.Document, ctx context.Context, question string) {
@@ -98,11 +142,10 @@ func ask(docs []schema.Document, ctx context.Context, question string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	rag_template := `
+	ragTemplate := `
 	You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. If you don't know the answer, just say that you don't know. Use three sentences maximum and keep the answer concise.
 
 	<context>
-	{context}
  	{{.context}}
 	</context>
 
@@ -110,8 +153,8 @@ func ask(docs []schema.Document, ctx context.Context, question string) {
 
 	{{.question}}
 `
-	prompts := prompts.NewPromptTemplate(rag_template, []string{"context", "question"})
-	chain1 := chains.NewLLMChain(llm, prompts)
+	pros := prompts.NewPromptTemplate(ragTemplate, []string{"context", "question"})
+	chain1 := chains.NewLLMChain(llm, pros)
 	m := make(map[string]any)
 	m["context"] = docs
 	m["question"] = question
@@ -119,5 +162,5 @@ func ask(docs []schema.Document, ctx context.Context, question string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(res)
+	log.Println(res)
 }
